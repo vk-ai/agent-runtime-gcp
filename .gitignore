@@ -1,0 +1,15 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+*.sqlite
+*.sqlite-*
+*.db
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate*
+terraform/*.tfvars
+!terraform/example.tfvars
+dist/
+build/

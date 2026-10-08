@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: agent-runtime
+    folder: Agent runtime
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

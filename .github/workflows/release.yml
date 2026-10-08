@@ -1,0 +1,141 @@
+# Release pipeline: build -> push -> deploy (manual approval) -> smoke test,
+# with automatic rollback on a failed smoke test and a manual rollback action.
+#
+# Nothing touches GCP unless these are configured (repo Settings -> Secrets/Variables):
+#   secrets.GCP_WORKLOAD_IDENTITY_PROVIDER, secrets.GCP_DEPLOY_SA
+#   vars.GCP_PROJECT_ID, vars.GCP_REGION (default europe-west2)
+# The `production` environment should have required reviewers so deploys pause for approval.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy or rollback"
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      rollback_to:
+        description: "Revision to roll back to (blank = the previous ready revision)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE: agent-runtime
+  REGION: ${{ vars.GCP_REGION || 'europe-west2' }}
+  PROJECT: ${{ vars.GCP_PROJECT_ID }}
+  GCP_ENABLED: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_PROJECT_ID != '' }}
+
+jobs:
+  build:
+    if: github.event_name == 'push' || inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"
+          echo "image=${REGION}-docker.pkg.dev/${PROJECT:-local}/${SERVICE}/api:${TAG}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
+      - name: Smoke-test image locally (in-memory persistence)
+        run: |
+          docker run -d --name smoke -p 8080:8080 -e AGENTRT_PERSISTENCE=memory -e AGENTRT_OTEL=off "${{ steps.meta.outputs.image }}"
+          for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS -X POST localhost:8080/runs -H 'content-type: application/json' \
+            -d '{"user_id":"ci","task":"summarise the release notes"}' | grep -q '"status":"succeeded"'
+          docker rm -f smoke
+      - name: Authenticate to GCP
+        if: env.GCP_ENABLED == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+      - name: Push image
+        if: env.GCP_ENABLED == 'true'
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker push "${{ steps.meta.outputs.image }}"
+      - name: Skipped push
+        if: env.GCP_ENABLED != 'true'
+        run: echo "::notice::GCP secrets not configured; image built and smoke-tested but not pushed."
+
+  deploy:
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Skip without GCP
+        if: env.GCP_ENABLED != 'true'
+        run: echo "::notice::GCP secrets not configured; deploy skipped."
+      - uses: google-github-actions/auth@v2
+        if: env.GCP_ENABLED == 'true'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+        if: env.GCP_ENABLED == 'true'
+      - name: Record current revision (rollback target)
+        id: prev
+        if: env.GCP_ENABLED == 'true'
+        run: |
+          PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+          echo "revision=$PREV" >> "$GITHUB_OUTPUT"
+      - name: Deploy new revision with no traffic
+        if: env.GCP_ENABLED == 'true'
+        run: |
+          gcloud run deploy "$SERVICE" --region "$REGION" --image "${{ needs.build.outputs.image }}" \
+            --no-traffic --tag candidate --quiet
+      - name: Smoke test the candidate revision
+        id: smoke
+        if: env.GCP_ENABLED == 'true'
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.traffic[].url)' | tr ';' '\n' | grep candidate | head -1)
+          TOKEN=$(gcloud auth print-identity-token)
+          curl -fsS -H "Authorization: Bearer $TOKEN" "$URL/healthz"
+      - name: Shift 100% traffic to the new revision
+        if: env.GCP_ENABLED == 'true' && steps.smoke.outcome == 'success'
+        run: gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-latest --quiet
+      - name: Automatic rollback on failure
+        if: failure() && env.GCP_ENABLED == 'true' && steps.prev.outputs.revision != ''
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" \
+            --to-revisions "${{ steps.prev.outputs.revision }}=100" --quiet
+
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'rollback'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Skip without GCP
+        if: env.GCP_ENABLED != 'true'
+        run: echo "::notice::GCP secrets not configured; rollback skipped."
+      - uses: google-github-actions/auth@v2
+        if: env.GCP_ENABLED == 'true'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+        if: env.GCP_ENABLED == 'true'
+      - name: Roll traffic back to the previous revision
+        if: env.GCP_ENABLED == 'true'
+        env:
+          TARGET: ${{ inputs.rollback_to }}
+        run: |
+          if [ -z "$TARGET" ]; then
+            CURRENT=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.traffic[0].revisionName)')
+            TARGET=$(gcloud run revisions list --service "$SERVICE" --region "$REGION" \
+              --sort-by='~metadata.creationTimestamp' --format='value(metadata.name)' | grep -v "^${CURRENT}$" | head -1)
+          fi
+          test -n "$TARGET" || { echo "no previous revision found"; exit 1; }
+          echo "Rolling back to $TARGET"
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$TARGET=100" --quiet
