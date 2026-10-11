@@ -27,7 +27,7 @@ POST /runs ──► LangGraph StateGraph (checkpointed after every node)
 | Capability | How |
 |---|---|
 | Resumable runs | `AsyncPostgresSaver` (or SQLite / in-memory). Every node's output is checkpointed with `durability="sync"` (committed before the next node starts; LangGraph's default `async` mode lost the last step on a hard kill in testing), so a run restarted after a crash continues from the last finished node. On startup the service resumes runs left `running` by a dead process. |
-| Human approval | Risky actions (`deploy`, `delete`, `refund`, `pay`, `email`, `send`) hit a node that calls `langgraph.types.interrupt()`. `POST /runs/{id}/decision` resumes it with `Command(resume=...)`, even from a different process. |
+| Human approval | Risky actions (`deploy`, `delete`, `refund`, `pay`, `email`, `send`) hit a node that calls `langgraph.types.interrupt()`. `POST /runs/{id}/decision` resumes it with `Command(resume=...)`, even from a different process. Reviewers can **approve, reject or edit the action's arguments** (`approvals.py`): each pause writes a pending record holding a SHA-256 digest of the action type and arguments, plus an expiry. A decision can be bound to the `pending_id` and `args_digest` the reviewer saw, and it's refused (409) if they no longer match. The record is single use and expires (410, and the run is rejected). An edit may only change existing argument keys, using scalar values, and both the original and the approved digest are recorded. Every decision goes to a decision log. There are optional per-reviewer tokens and an optional no-self-approval rule. The legacy `{approved, reviewer}` body still works. |
 | Side-effect safety on resume | `execute_action` writes an idempotency record before its checkpoint, so a crash between the side effect and the checkpoint doesn't repeat it. |
 | Long-term memory | LangGraph `BaseStore` (`AsyncPostgresStore` / `AsyncSqliteStore` / `InMemoryStore`), namespaced per user. "remember that ..." facts are stored and recalled in later runs. |
 | Provider failover | Ordered providers with retryable vs fatal errors (429, 5xx and timeouts fail over; 4xx doesn't) and a per-provider circuit breaker. Real OpenAI-compatible provider via `OPENAI_BASE_URL`; mocks otherwise. |
@@ -66,9 +66,10 @@ OpenTelemetry Collector, Prometheus and Grafana (http://localhost:3000, with the
 | Method | Path | |
 |---|---|---|
 | `POST` | `/runs` | `{user_id, task, run_id?}`. Runs until it finishes or pauses for approval. |
-| `GET` | `/runs/{id}` | Status, steps, pending approval payload, result, cost. |
+| `GET` | `/runs/{id}` | Status, steps, pending approval payload, `pending_decision` (`pending_id`, `args_digest`, `args`, `expires_at`), result, cost. |
 | `GET` | `/runs?status=` | List runs from the registry. |
-| `POST` | `/runs/{id}/decision` | `{approved, reviewer, comment}`. Needs `X-Approver-Token` if `AGENTRT_APPROVER_TOKEN` is set. |
+| `POST` | `/runs/{id}/decision` | New: `{decision: "approve"\|"reject"\|"edit", pending_id?, args_digest?, edited_args?, reviewer?, comment}`. Legacy: `{approved, reviewer, comment}`. Needs `X-Approver-Token` if a shared or per-reviewer token is configured; with a per-reviewer token, the reviewer is taken from the token. Returns 409 for a stale `pending_id`/`args_digest` or an already-used decision, 410 if expired, 422 for an invalid edit and 403 for self-approval or a token/reviewer mismatch. |
+| `GET` | `/runs/{id}/decisions`, `/decisions?limit=` | Decision log: reviewer, decision (`approved`/`rejected`/`edited`/`expired`), time, original args and digest, edited args and approved digest. |
 | `POST` | `/runs/{id}/resume` | Resume a `failed` (or orphaned `running`) run from its last checkpoint. |
 | `GET` | `/users/{id}/memories` | Long-term memories for a user. |
 | `GET` | `/metrics/summary` | Stuck and waiting-for-approval run IDs (also exported as OTel gauges). |
@@ -86,6 +87,9 @@ OpenTelemetry Collector, Prometheus and Grafana (http://localhost:3000, with the
 | `AGENTRT_STUCK_AFTER_S` | `120` | Heartbeat age after which a `running` run counts as stuck/orphaned |
 | `AGENTRT_OTEL` | `off` | `console` or `otlp` (uses the standard `OTEL_EXPORTER_OTLP_ENDPOINT`) |
 | `AGENTRT_APPROVER_TOKEN` | unset | Shared secret for the decision endpoint |
+| `AGENTRT_REVIEWER_TOKENS` | unset | JSON `{token: reviewer_id}`. Per-reviewer tokens; the decision is attributed to the token's reviewer |
+| `AGENTRT_APPROVAL_TTL_S` | `3600` | Pending approvals expire after this many seconds (`0` = never) |
+| `AGENTRT_FORBID_SELF_APPROVAL` | `0` | `1` refuses decisions where the reviewer is the run's `user_id` |
 
 ## Demo run
 
@@ -150,13 +154,14 @@ checkpoint.
 
 ## Tests
 
-`pytest -q` gives **41 passed, 1 skipped** offline in about 2 seconds. With
-`AGENTRT_PG_DSN` set, **42 passed**, which the `postgres` CI job runs against a
+`pytest -q` gives **52 passed, 1 skipped** offline in about 2 seconds. With
+`AGENTRT_PG_DSN` set, **53 passed**, which the `postgres` CI job runs against a
 Postgres 16 service container. Coverage is about 91%; the CLI is exercised
 through a subprocess test, so it isn't counted.
 
 - `test_providers.py`: mock fault modes, failover order, fatal vs retryable, circuit breaker open/half-open, OpenAI-compatible client against `httpx.MockTransport` (usage parsing, 429/5xx/4xx mapping, timeouts).
 - `test_runtime.py`: graph paths, approval/reject, invalid transitions, memory across runs and users, failover inside the graph, all providers down → `failed` → resume from `plan`, orphan recovery by a second manager, stuck-run gauge, no duplicate side effect on resume, SQLite durability across processes, and Postgres durability across connection pools.
+- `test_approvals.py`: the digest covers the type and args only; edit validation; bound approve; single use; edit runs the edited args and records both digests; an invalid edit leaves the run pending; stale `pending_id`/digest → refused; expiry → rejected run; no-self-approval; and over HTTP, per-reviewer tokens (401/403/422/409), the decision log, 410 on expiry and the legacy shared-token body.
 - `test_crash_subprocess.py`: the CLI is hard-killed inside a node and a new interpreter resumes the run from SQLite.
 - `test_api.py`: the HTTP surface through FastAPI's `TestClient`, including 404/409/401.
 
@@ -200,13 +205,15 @@ every GCP step is skipped with a notice, so forks and CI stay green.
 
 **Stubbed or not verified:**
 - **The LLM is a deterministic mock by default.** Its "plan" is a template string and there is no real reasoning or tool use. The OpenAI-compatible provider is unit-tested against a mocked HTTP transport, not a live API.
-- **Actions are simulated.** `execute_action` returns `"simulated deploy executed"`, and nothing is actually deployed, deleted or paid.
+- **Actions are simulated.** `execute_action` returns `"simulated deploy executed with {args}"`, and nothing is actually deployed, deleted or paid.
 - **Memory is naive.** It stores "remember that ..." phrases by regex, with no embeddings or semantic search.
 - **Costs use an illustrative price table** and whitespace token counts for mocks. They are not real provider prices.
 - **Terraform has never been applied.** It validates, but I haven't run `plan` or `apply` against a GCP project.
 - **The release pipeline has never run against GCP.** The GCP steps are skipped without secrets, and the candidate smoke test's identity-token call may need an `--audiences` flag depending on how WIF is set up.
 - **Docker Compose, the Collector, Prometheus and Grafana are untested.** The machine this was built on has no Docker. The dashboard's PromQL assumes the Collector's Prometheus naming (`_total` and unit suffixes) and may need small fixes.
-- **Approval auth is a single shared token.** There are no users, roles or OIDC.
+- **Approval auth is static tokens.** It's either one shared token or a per-reviewer `{token: reviewer}` map from an env var. There's no SSO/OIDC, no roles and no token rotation. Self-approval is only blocked if you turn it on, and it compares reviewer IDs as plain strings.
+- **Single-use decisions aren't a cross-replica compare-and-swap.** A pending record is consumed under a per-process lock and a status check in the store. Two replicas that receive the same decision at the same instant could both accept it, which is the same limitation as orphan takeover below. Expiry is only checked when a decision arrives; there's no background sweeper.
+- **Action arguments are a toy.** Detected actions get one `target` argument (the text after the keyword), so "edit" means rewording that string.
 - **Multi-replica takeover isn't safe.** Orphan recovery uses a heartbeat threshold, not a lease or lock, so two replicas could both resume the same orphan at the same moment.
 
 ## Layout

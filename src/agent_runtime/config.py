@@ -1,6 +1,7 @@
 """Settings from environment variables."""
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -24,6 +25,10 @@ class Settings:
     recover_on_start: bool = True
     watchdog_interval_s: float = 15.0
     approver_token: str | None = None
+    # Per-reviewer tokens {token: reviewer_id}. The decision's reviewer is taken from the token.
+    reviewer_tokens: dict[str, str] = field(default_factory=dict)
+    approval_ttl_s: float = 3600.0  # pending approvals expire after this (0 = never)
+    forbid_self_approval: bool = False  # reject decisions where reviewer == the run's user_id
     crash_at: str | None = None  # demo only: os._exit() when this node starts
 
     @classmethod
@@ -46,6 +51,9 @@ class Settings:
             recover_on_start=e.get("AGENTRT_RECOVER_ON_START", "1") not in ("0", "false", "no"),
             watchdog_interval_s=float(e.get("AGENTRT_WATCHDOG_INTERVAL_S", "15")),
             approver_token=e.get("AGENTRT_APPROVER_TOKEN"),
+            reviewer_tokens=json.loads(e.get("AGENTRT_REVIEWER_TOKENS") or "{}"),
+            approval_ttl_s=float(e.get("AGENTRT_APPROVAL_TTL_S", "3600")),
+            forbid_self_approval=e.get("AGENTRT_FORBID_SELF_APPROVAL", "0") in ("1", "true", "yes"),
             crash_at=e.get("AGENTRT_CRASH_AT"),
         )
 
