@@ -13,6 +13,7 @@ the last completed node (see `service.RunManager.resume`).
 """
 from __future__ import annotations
 
+import json
 import operator
 import re
 import uuid
@@ -54,7 +55,9 @@ def detect_action(task: str) -> dict | None:
     lowered = task.lower()
     for kw in RISKY_ACTIONS:
         if re.search(rf"\b{kw}\b", lowered):
-            return {"type": kw, "description": task.strip()[:200]}
+            m = re.search(rf"\b{kw}\b\s*(.*)", task.strip(), re.IGNORECASE | re.DOTALL)
+            target = (m.group(1) if m else "").strip().rstrip(".")[:200]
+            return {"type": kw, "description": task.strip()[:200], "args": {"target": target}}
     return None
 
 
@@ -112,13 +115,22 @@ def build_graph(router: FailoverRouter, on_node: NodeHook | None = None) -> Stat
         )
         if not isinstance(decision, dict) or "approved" not in decision:
             raise ValueError("resume value must be a dict with an 'approved' key")
-        return {
+        approved = bool(decision["approved"])
+        out: dict[str, Any] = {
             "approval": {
-                "approved": bool(decision["approved"]),
+                "approved": approved,
                 "reviewer": str(decision.get("reviewer", "unknown")),
                 "comment": str(decision.get("comment", "")),
+                "decision": str(decision.get("decision") or ("approve" if approved else "reject")),
             }
         }
+        for k in ("pending_id", "original_args_digest", "approved_args_digest"):
+            if decision.get(k):
+                out["approval"][k] = decision[k]
+        if approved and isinstance(decision.get("edited_args"), dict):
+            a = dict(state["action"])
+            out["action"] = {**a, "args": dict(decision["edited_args"]), "original_args": a.get("args") or {}}
+        return out
 
     @node("execute_action")
     async def execute_action(state: AgentState, store: BaseStore):
@@ -130,7 +142,8 @@ def build_graph(router: FailoverRouter, on_node: NodeHook | None = None) -> Stat
         if done is not None:
             return {"action_result": done.value["result"] + " (deduplicated on resume)"}
         a = state["action"]
-        result = f"simulated {a['type']} executed"
+        args = a.get("args") or {}
+        result = f"simulated {a['type']} executed" + (f" with {json.dumps(args, sort_keys=True)}" if args else "")
         await store.aput(ns, "executed", {"result": result})
         await _hook("execute_action:after_side_effect", state)  # crash window used by tests/demo
         return {"action_result": result}
